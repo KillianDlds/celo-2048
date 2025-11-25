@@ -6,6 +6,7 @@ import { useAccount } from "wagmi";
 import { openConnectModal } from "../librairies/appKit";
 import Celo_2048_ABI from "../Celo2048_ABI.json";
 import { NETWORKS } from "../constants/networks";
+import { sdk } from "@farcaster/miniapp-sdk";
 
 export default function GameBoard({ gameMode = "classic", network, switchNetwork, NETWORKS: parentNetworks }) {
   const size = getSize(gameMode);
@@ -13,17 +14,37 @@ export default function GameBoard({ gameMode = "classic", network, switchNetwork
   const [grid, setGrid] = useState(() => addRandomTile(addRandomTile(emptyGrid(size))));
   const [mergedGrid, setMergedGrid] = useState(() => emptyGrid(size));
   const [score, setScore] = useState(0);
-  const [bestScore, setBestScore] = useState(0); 
+  const [bestScore, setBestScore] = useState(0);
   const [timer, setTimer] = useState(0);
   const [timerActive, setTimerActive] = useState(false);
   const [gameOver, setGameOver] = useState(false);
   const [scoreSaved, setScoreSaved] = useState(false);
+  const [currentChainId, setCurrentChainId] = useState(null);
+
 
   const { isConnected, address } = useAccount();
 
   const touchStartRef = useRef(null);
   const touchEndRef = useRef(null);
 
+  const NETWORK_CONTRACTS = {
+    "42220": process.env.REACT_APP_CONTRACT_ADDRESS_CELO_MAINNET,
+    "0xa4ec": process.env.REACT_APP_CONTRACT_ADDRESS_CELO_MAINNET,
+
+    "1114572": process.env.REACT_APP_CONTRACT_ADDRESS_CELO_SEPOLIA,
+    "0xaa044c": process.env.REACT_APP_CONTRACT_ADDRESS_CELO_SEPOLIA,
+  };
+
+
+  useEffect(() => {
+    if (window.ethereum) {
+      window.ethereum.request({ method: "eth_chainId" }).then(setCurrentChainId);
+
+      window.ethereum.on("chainChanged", (id) => {
+        setCurrentChainId(id);
+      });
+    }
+  }, []);
 
   const resolveContractAddress = useCallback(async () => {
     const nets = parentNetworks || NETWORKS || {};
@@ -112,7 +133,7 @@ export default function GameBoard({ gameMode = "classic", network, switchNetwork
     if (address) {
       fetchMyBestScore();
     } else {
-      setBestScore(0); 
+      setBestScore(0);
     }
   }, [address, fetchMyBestScore]);
 
@@ -178,7 +199,7 @@ export default function GameBoard({ gameMode = "classic", network, switchNetwork
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [grid, gameOver, bestScore, timerActive]); 
+  }, [grid, gameOver, bestScore, timerActive]);
 
   useEffect(() => {
     if (!timerActive || gameOver) return;
@@ -211,64 +232,96 @@ export default function GameBoard({ gameMode = "classic", network, switchNetwork
       openConnectModal();
       return;
     }
+
     if (scoreSaved) return;
 
-    if (!window.ethereum) {
-      console.warn("Wallet not found");
-      alert("Wallet not found. Please install MetaMask or another wallet.");
-      return;
-    }
-
     try {
-      console.debug("Saving score", { score, timer });
-      const web3 = new Web3(window.ethereum);
+      let chainId = null;
+      let from = null;
+      let txData = null;
 
-      let accounts = await web3.eth.getAccounts();
-      if (!accounts || accounts.length === 0) {
-        console.debug("No accounts returned by provider, requesting accounts...");
-        accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
-      }
-      console.debug("Accounts", accounts);
+      // ---------------------------
+      // 1) Prépare la transaction (encode ABI)
+      // ---------------------------
+      const contractAddress =
+        NETWORK_CONTRACTS[currentChainId] ||
+        NETWORK_CONTRACTS["0x" + Number(currentChainId).toString(16)];
 
-      const contractAddress = await resolveContractAddress();
       if (!contractAddress) {
-        console.error("Contract address not resolved.");
-        alert("Contract address not configured. Contact the developer.");
+        alert("Aucun contrat pour ce réseau.");
         return;
       }
 
-      const contract = new web3.eth.Contract(Celo_2048_ABI, contractAddress);
+      // Web3 local juste pour encoder la méthode
+      const web3Local = new Web3();
+      const contractLocal = new web3Local.eth.Contract(Celo_2048_ABI, contractAddress);
+      txData = contractLocal.methods.saveScore(score, timer).encodeABI();
 
-      try {
-        const chainId = await window.ethereum.request({ method: "eth_chainId" });
-        console.debug("Current chainId:", chainId);
-      } catch (err) {
-        console.warn("Could not read chainId before transaction:", err);
-      }
+      // ---------------------------
+      // 2) FARCASTER MINI APP ?
+      // ---------------------------
+      const isFarcaster = typeof sdk !== "undefined" && sdk?.Ethereum;
 
-      await contract.methods.saveScore(score, timer).send({ from: accounts[0] });
-      setScoreSaved(true);
+      if (isFarcaster) {
+        console.log("➡️ Sending TX via Farcaster SDK");
 
-      if (typeof window !== "undefined") {
-        if (typeof window.refreshLeaderboard === "function") {
-          try {
-            await window.refreshLeaderboard();
-          } catch (err) {
-            console.warn("window.refreshLeaderboard failed:", err);
-          }
+        // Adresse Farcaster
+        const accounts = await sdk.Ethereum.getAccounts();
+        from = accounts?.[0];
+        if (!from) {
+          alert("Aucune adresse Farcaster détectée.");
+          return;
         }
+
+        // ChainId Farcaster
+        chainId = Number(await sdk.Ethereum.getChainId());
+
+        // Envoi transaction via Farcaster
+        await sdk.Ethereum.sendTransaction({
+          from,
+          to: contractAddress,
+          data: txData,
+          chainId
+        });
+
+        setScoreSaved(true);
+        alert("Score saved successfully!");
+        window.refreshLeaderboard?.();
+        return;
       }
 
-      await fetchMyBestScore();
-    } catch (err) {
-      console.error("Erreur transaction :", err);
-      if (err?.code === 4001) {
-        alert("Transaction rejected by the user.");
-      } else if (err?.message) {
-        alert(`Erreur lors de l'envoi du score: ${err.message}`);
-      } else {
-        alert("Erreur lors de l'envoi du score");
+      // ---------------------------
+      // 3) MODE WEB CLASSIQUE (Metamask / Rabby)
+      // ---------------------------
+      console.log("➡️ Sending TX via web3 provider");
+
+      if (!window.ethereum) {
+        alert("Aucun wallet détecté.");
+        return;
       }
+
+      const web3 = new Web3(window.ethereum);
+      chainId = await window.ethereum.request({ method: "eth_chainId" });
+      from = (await window.ethereum.request({ method: "eth_requestAccounts" }))?.[0];
+
+      await window.ethereum.request({
+        method: "eth_sendTransaction",
+        params: [
+          {
+            from,
+            to: contractAddress,
+            data: txData
+          }
+        ]
+      });
+
+      setScoreSaved(true);
+      alert("Score saved !");
+      window.refreshLeaderboard?.();
+
+    } catch (err) {
+      console.error("SaveScore failed:", err);
+      alert("Erreur: " + (err?.message || err));
     }
   };
 
@@ -380,10 +433,10 @@ export default function GameBoard({ gameMode = "classic", network, switchNetwork
               {label === "Score"
                 ? score
                 : label === "Best Score"
-                ? bestScore
-                : gameMode === "time"
-                ? `${Math.max(0, 60 - timer)}s`
-                : `${Math.floor(timer / 60)}:${(timer % 60).toString().padStart(2, "0")}`}
+                  ? bestScore
+                  : gameMode === "time"
+                    ? `${Math.max(0, 60 - timer)}s`
+                    : `${Math.floor(timer / 60)}:${(timer % 60).toString().padStart(2, "0")}`}
             </span>
           </div>
         ))}
