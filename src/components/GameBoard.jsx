@@ -132,7 +132,6 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
       console.debug("Saving score", { score, timer });
       const web3 = new Web3(window.ethereum);
 
-      // Ensure we have accounts available; request if necessary
       let accounts = await web3.eth.getAccounts();
       if (!accounts || accounts.length === 0) {
         console.debug("No accounts returned by provider, requesting accounts...");
@@ -140,13 +139,10 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
       }
       console.debug("Accounts", accounts);
 
-      // Validate contract address / chain
       const chainId = await window.ethereum.request({ method: "eth_chainId" });
       console.debug("chainId", chainId);
-      // If env var not set or user uses a different network, try to pick address from NETWORKS mapping
       const NETWORKS_USED = parentNetworks || NETWORKS;
       let contractAddress = process.env.REACT_APP_CONTRACT_ADDRESS_CELO_SEPOLIA;
-      // Look up by chainId in our NETWORKS constant
       const foundNet = Object.values(NETWORKS_USED).find((n) => n.chainId?.toLowerCase() === chainId?.toLowerCase());
       if (foundNet) contractAddress = foundNet.contractAddress;
 
@@ -158,40 +154,31 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
 
       const contract = new web3.eth.Contract(Celo_2048_ABI, contractAddress);
 
-      // If connected to a chain that's not the expected one, inform the user
-      // We're checking for Sepolia (example) but you can adapt per your supported chains
-      // prefer the selected `network` prop (from App.js) as expected chain id if available
+      
       const targetNetworkKey = network || (foundNet && Object.keys(NETWORKS_USED).find(k => NETWORKS_USED[k].chainId?.toLowerCase() === chainId?.toLowerCase()));
       const expectedChainId = process.env.REACT_APP_CHAIN_ID_CELO_SEPOLIA || (targetNetworkKey && NETWORKS_USED[targetNetworkKey] && NETWORKS_USED[targetNetworkKey].chainId) || (foundNet && foundNet.chainId) || "0xAA044C";
       if (chainId !== expectedChainId) {
         try {
           if (switchNetwork && targetNetworkKey) {
-            // If the parent passed a `switchNetwork` function, use it (it shows a toast)
             await switchNetwork(targetNetworkKey);
           } else {
-            // Fallback to performing a switch ourselves
             await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: expectedChainId }] });
           }
         } catch (switchErr) {
-          // Don't show aggressive alerts. Log and gracefully abort; App should show network UI change.
           console.warn("Unable to switch network automatically", switchErr);
           return;
         }
       }
       
-      // If we have an intended target network, pick its contract address explicitly (safer than previous detected chain ID)
       if (targetNetworkKey && NETWORKS_USED[targetNetworkKey]) {
         contractAddress = NETWORKS_USED[targetNetworkKey].contractAddress;
       }
 
-      // Send transaction and let the wallet prompt the user to sign
       await contract.methods.saveScore(score, timer).send({ from: accounts[0] });
       setScoreSaved(true);
     } catch (err) {
       console.error("Erreur transaction :", err);
-      // Be more specific for the user
       if (err?.code === 4001) {
-        // User rejected the request
         alert("Transaction rejected by the user.");
       } else if (err?.message) {
         alert(`Erreur lors de l'envoi du score: ${err.message}`);
