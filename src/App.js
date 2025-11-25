@@ -315,6 +315,7 @@ export default function App() {
         setScoreSaved={setScoreSaved}
         connectWallet={connectWallet}
         network={network}
+        switchNetwork={switchNetwork}
         NETWORKS={NETWORKS}
         gameMode={gameMode}
       />
