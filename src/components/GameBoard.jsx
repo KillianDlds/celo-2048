@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import Tile from "./Tile";
 import { getSize, emptyGrid, addRandomTile, isGameOver, moveGrid } from "../utils/gameLogic";
 import Web3 from "web3";
@@ -7,13 +7,13 @@ import { openConnectModal } from "../librairies/appKit";
 import Celo_2048_ABI from "../Celo2048_ABI.json";
 import { NETWORKS } from "../constants/networks";
 
-export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: parentNetworks }) {
+export default function GameBoard({ gameMode = "classic", network, switchNetwork, NETWORKS: parentNetworks }) {
   const size = getSize(gameMode);
 
   const [grid, setGrid] = useState(() => addRandomTile(addRandomTile(emptyGrid(size))));
   const [mergedGrid, setMergedGrid] = useState(() => emptyGrid(size));
   const [score, setScore] = useState(0);
-  const [bestScore, setBestScore] = useState(0);
+  const [bestScore, setBestScore] = useState(0); 
   const [timer, setTimer] = useState(0);
   const [timerActive, setTimerActive] = useState(false);
   const [gameOver, setGameOver] = useState(false);
@@ -24,7 +24,99 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
   const touchStartRef = useRef(null);
   const touchEndRef = useRef(null);
 
-  // Swipe mobile
+
+  const resolveContractAddress = useCallback(async () => {
+    const nets = parentNetworks || NETWORKS || {};
+
+    let chainId = null;
+    try {
+      if (window.ethereum) {
+        chainId = await window.ethereum.request({ method: "eth_chainId" });
+      }
+    } catch (err) {
+      console.warn("Could not read eth_chainId:", err);
+    }
+
+    if (!chainId && network && nets[network] && nets[network].chainId) {
+      chainId = nets[network].chainId;
+    }
+
+    if (!chainId) {
+      chainId = process.env.REACT_APP_CHAIN_ID || null;
+    }
+
+    if (!chainId) {
+      console.warn("resolveContractAddress: no chainId determined");
+      return null;
+    }
+
+    const tryKeys = [String(chainId).toLowerCase()];
+    try {
+      if (String(chainId).startsWith("0x")) {
+        tryKeys.push(String(parseInt(chainId, 16)));
+      } else if (!String(chainId).startsWith("0x")) {
+        tryKeys.push("0x" + parseInt(chainId, 10).toString(16));
+      }
+    } catch (e) {
+    }
+
+    for (const k of tryKeys) {
+      const found = Object.keys(nets).find((key) => String(key).toLowerCase() === String(k).toLowerCase());
+      if (found && nets[found] && nets[found].contractAddress) {
+        console.debug("resolveContractAddress found via nets mapping:", found, nets[found].contractAddress);
+        return nets[found].contractAddress;
+      }
+    }
+
+    const envMain = process.env.REACT_APP_CONTRACT_ADDRESS_CELO_MAINNET;
+    const envSepolia = process.env.REACT_APP_CONTRACT_ADDRESS_CELO_SEPOLIA;
+    const dec = tryKeys.find(k => !String(k).startsWith("0x"));
+    if (dec) {
+      if (dec === "42220" && envMain) return envMain;
+      if ((dec === "1114572" || dec === "44787" || dec === "111") && envSepolia) return envSepolia;
+    }
+
+    return envSepolia || envMain || null;
+  }, [network, parentNetworks]);
+
+  const fetchMyBestScore = useCallback(async () => {
+    if (!address) {
+      console.debug("fetchMyBestScore: no address connected");
+      return;
+    }
+    if (!window.ethereum) {
+      console.debug("fetchMyBestScore: no provider (window.ethereum)");
+      return;
+    }
+
+    try {
+      const contractAddress = await resolveContractAddress();
+      if (!contractAddress) {
+        console.warn("fetchMyBestScore: no contract address resolved");
+        return;
+      }
+      const web3 = new Web3(window.ethereum);
+      const contract = new web3.eth.Contract(Celo_2048_ABI, contractAddress);
+
+      const myScores = await contract.methods.scores(address).call();
+      const onchainBest = Number(myScores.bestScore ?? myScores[0] ?? 0);
+      console.debug("fetchMyBestScore ->", { address, contractAddress, onchainBest, raw: myScores });
+
+      setBestScore(onchainBest);
+    } catch (err) {
+      console.error("fetchMyBestScore failed:", err);
+    }
+  }, [address, resolveContractAddress]);
+
+  useEffect(() => {
+    if (address) {
+      fetchMyBestScore();
+    } else {
+      setBestScore(0); 
+    }
+  }, [address, fetchMyBestScore]);
+
+
   const getSwipeDirection = (start, end) => {
     if (!start || !end) return null;
     const dx = end.x - start.x;
@@ -53,7 +145,7 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
     }
   };
 
-  // Déplacement
+
   const handleMove = (dir) => {
     if (!timerActive) setTimerActive(true);
     const result = moveGrid(grid, dir);
@@ -61,7 +153,9 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
 
     setScore((prev) => {
       const newScore = prev + result.gainedScore;
-      if (newScore > bestScore) setBestScore(newScore);
+      if (newScore > bestScore) {
+        setBestScore(newScore);
+      }
       return newScore;
     });
 
@@ -74,7 +168,6 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
     }
   };
 
-  // Clavier
   useEffect(() => {
     const handleKey = (e) => {
       if (gameOver) return;
@@ -85,9 +178,8 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [grid, gameOver]);
+  }, [grid, gameOver, bestScore, timerActive]); 
 
-  // Timer
   useEffect(() => {
     if (!timerActive || gameOver) return;
     const interval = setInterval(() => {
@@ -114,7 +206,6 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
     setScoreSaved(false);
   };
 
-  // **Bouton Save : envoi transaction on-chain**
   const handleSaveClick = async () => {
     if (!isConnected) {
       openConnectModal();
@@ -139,43 +230,36 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
       }
       console.debug("Accounts", accounts);
 
-      const chainId = await window.ethereum.request({ method: "eth_chainId" });
-      console.debug("chainId", chainId);
-      const NETWORKS_USED = parentNetworks || NETWORKS;
-      let contractAddress = process.env.REACT_APP_CONTRACT_ADDRESS_CELO_SEPOLIA;
-      const foundNet = Object.values(NETWORKS_USED).find((n) => n.chainId?.toLowerCase() === chainId?.toLowerCase());
-      if (foundNet) contractAddress = foundNet.contractAddress;
-
+      const contractAddress = await resolveContractAddress();
       if (!contractAddress) {
-        console.error("Contract address not set for CELO_SEPOLIA");
+        console.error("Contract address not resolved.");
         alert("Contract address not configured. Contact the developer.");
         return;
       }
 
       const contract = new web3.eth.Contract(Celo_2048_ABI, contractAddress);
 
-      
-      const targetNetworkKey = network || (foundNet && Object.keys(NETWORKS_USED).find(k => NETWORKS_USED[k].chainId?.toLowerCase() === chainId?.toLowerCase()));
-      const expectedChainId = process.env.REACT_APP_CHAIN_ID_CELO_SEPOLIA || (targetNetworkKey && NETWORKS_USED[targetNetworkKey] && NETWORKS_USED[targetNetworkKey].chainId) || (foundNet && foundNet.chainId) || "0xAA044C";
-      if (chainId !== expectedChainId) {
-        try {
-          if (switchNetwork && targetNetworkKey) {
-            await switchNetwork(targetNetworkKey);
-          } else {
-            await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: expectedChainId }] });
-          }
-        } catch (switchErr) {
-          console.warn("Unable to switch network automatically", switchErr);
-          return;
-        }
-      }
-      
-      if (targetNetworkKey && NETWORKS_USED[targetNetworkKey]) {
-        contractAddress = NETWORKS_USED[targetNetworkKey].contractAddress;
+      try {
+        const chainId = await window.ethereum.request({ method: "eth_chainId" });
+        console.debug("Current chainId:", chainId);
+      } catch (err) {
+        console.warn("Could not read chainId before transaction:", err);
       }
 
       await contract.methods.saveScore(score, timer).send({ from: accounts[0] });
       setScoreSaved(true);
+
+      if (typeof window !== "undefined") {
+        if (typeof window.refreshLeaderboard === "function") {
+          try {
+            await window.refreshLeaderboard();
+          } catch (err) {
+            console.warn("window.refreshLeaderboard failed:", err);
+          }
+        }
+      }
+
+      await fetchMyBestScore();
     } catch (err) {
       console.error("Erreur transaction :", err);
       if (err?.code === 4001) {
@@ -187,6 +271,29 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
       }
     }
   };
+
+  useEffect(() => {
+    const onChainChanged = (chainId) => {
+      console.debug("Provider chainChanged:", chainId);
+      fetchMyBestScore();
+    };
+    if (window.ethereum && window.ethereum.on) {
+      window.ethereum.on("chainChanged", onChainChanged);
+    }
+    return () => {
+      if (window.ethereum && window.ethereum.removeListener) {
+        window.ethereum.removeListener("chainChanged", onChainChanged);
+      }
+    };
+  }, [fetchMyBestScore]);
+
+
+  useEffect(() => {
+    if (!isConnected) {
+      setBestScore(0);
+    }
+  }, [isConnected]);
+
 
   return (
     <>
@@ -294,6 +401,7 @@ export default function GameBoard({ gameMode, network, switchNetwork, NETWORKS: 
           borderRadius: "12px",
           boxShadow: "0 4px 10px rgba(0,0,0,0.15)",
           justifyContent: "center",
+          touchAction: "none",
         }}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
